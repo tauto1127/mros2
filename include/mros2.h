@@ -17,6 +17,7 @@ extern void *__dso_handle;
 #include <map>
 #include <mutex>
 #include <future>
+#include <vector>
 #include "rtps/common/types.h" //sample_identify struct
 
 namespace mros2
@@ -110,7 +111,8 @@ namespace mros2
     template <class T>
     void publish(T &msg);
     template <class T>
-    std::future<uint8_t *> async_send_request(T &msg);
+    std::future<std::vector<uint8_t>> async_send_request(
+        T &msg, uint32_t *request_id = nullptr);
   };
 
   class Subscriber
@@ -134,7 +136,9 @@ namespace mros2
   };
 
   void spin();
-  int spin_until_future_complete(mros2::Node node, std::future<uint8_t *> *response);
+  int spin_until_future_complete(mros2::Node node,
+                                 std::future<std::vector<uint8_t>> *response);
+  void cancel_service_request(uint32_t request_id);
   // void response_received_processingrCallback(uint8_t *msg)
   int wait_service(int timeout);
 

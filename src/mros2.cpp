@@ -14,20 +14,25 @@
 #include <condition_variable>
 #include <map>
 #include <future>
+#include <memory>
 #include <queue>
+#include <thread>
+#include <vector>
 // #include "rtps/common/types.h" //sample_identify struct
 
 // std::mutex mtx;             // wait で必要（とりあえず無視）
 // std::condition_variable cv; // これを介してスリープをコントロールする
-extern uint8_t *cacheChange_buffer;
-std::map<uint32_t, std::promise<uint8_t *>> promise_map;
+std::map<uint32_t, std::promise<std::vector<uint8_t>>> promise_map;
+// newChangeIdentify() が送信を開始してからpromise_mapへ登録するまでの
+// 短い区間に、ローカル/高速なサービス応答が届くことがある。その応答を
+// 捨てずに一時保持し、要求側の登録完了後に渡す。
+std::map<uint32_t, std::vector<uint8_t>> early_service_responses;
+constexpr size_t kMaxEarlyServiceResponses = 16;
 std::mutex map_mutex;
 // for service server
 std::queue<rtps::Sample_Indetify> request_identify_queue;
 std::mutex queue_mutex;
-uint8_t *cacheChange_buffer;
 
-std::mutex msg_mtx;
 namespace mros2
 {
 
@@ -187,12 +192,103 @@ namespace mros2
     return node;
   }
 
+  // ReaderCacheChange owns its data only for the duration of the reader
+  // callback.  A callback worker must therefore receive an owned copy, not a
+  // pointer into ReaderCacheChange.
+  class SubscriberCallbackWorker
+  {
+  public:
+    virtual ~SubscriberCallbackWorker() = default;
+    virtual void enqueue(const uint8_t *data, size_t size) = 0;
+  };
+
+  // One worker is created per subscription.  Its single message slot is
+  // deliberately overwrite-on-write: for state-like topics, running the
+  // newest callback is preferable to accumulating stale callbacks and it
+  // bounds both memory use and callback latency.
+  template <class T>
+  class LatestMessageCallbackWorker final : public SubscriberCallbackWorker
+  {
+  public:
+    explicit LatestMessageCallbackWorker(void (*callback)(intptr_t))
+        : callback_(callback), worker_(&LatestMessageCallbackWorker::run, this)
+    {
+    }
+
+    ~LatestMessageCallbackWorker() override
+    {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+      }
+      condition_.notify_one();
+      if (worker_.joinable())
+      {
+        worker_.join();
+      }
+    }
+
+    void enqueue(const uint8_t *data, size_t size) override
+    {
+      if (data == nullptr || size < SUB_MSG_SIZE)
+      {
+        MROS2_ERROR("[MROS2LIB] received malformed subscription payload");
+        return;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Capacity one / latest-value-wins. assign() copies the RTPS frame
+        // before ReaderCacheChange and its backing storage leave scope.
+        latest_message_.assign(data, data + size);
+        has_message_ = true;
+      }
+      condition_.notify_one();
+    }
+
+  private:
+    void run()
+    {
+      for (;;)
+      {
+        std::vector<uint8_t> message;
+        {
+          std::unique_lock<std::mutex> lock(mutex_);
+          condition_.wait(lock, [this] { return stopping_ || has_message_; });
+          if (stopping_ && !has_message_)
+          {
+            return;
+          }
+          message.swap(latest_message_);
+          has_message_ = false;
+        }
+
+        T msg;
+        const uint8_t *data = message.data();
+        msg.copyFromBuf(&data[SUB_MSG_SIZE]);
+        callback_((intptr_t)&msg);
+      }
+    }
+
+    void (*callback_)(intptr_t);
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::vector<uint8_t> latest_message_;
+    bool has_message_ = false;
+    bool stopping_ = false;
+    std::thread worker_;
+  };
+
   typedef struct
   {
     void (*cb_fp)(intptr_t);
     void (*cb_fp_srv)(intptr_t, intptr_t);
     intptr_t argp;
     rtps::Writer *pub_ptr_own;
+    // create_client() の Reply reader はpromiseを解決するだけで、T は
+    // Request 型である。Response frameをTとしてデシリアライズしてはいけない。
+    bool service_response_only = false;
+    std::unique_ptr<SubscriberCallbackWorker> callback_worker;
   } SubscribeDataType;
 
   // typedef struct
@@ -268,6 +364,10 @@ namespace mros2
     data_p = new SubscribeDataType;
     data_p->cb_fp = (void (*)(intptr_t))fp;
     data_p->argp = (intptr_t)NULL;
+    // Tはservice request型、Readerが受けるのはresponse型であるため、
+    // ここではTへのデシリアライズを行わない。callback_handlerがfutureを
+    // 完了した時点で返す。
+    data_p->service_response_only = true;
     reader->registerCallback(sub.callback_handler<T>, (void *)data_p); // templeteの関数を登録
 
     /* Register callback to ensure that a subscriber is matched to the reader before receiving messages */
@@ -279,10 +379,35 @@ namespace mros2
     return pub;
   }
 
-  int spin_until_future_complete(Node node, std::future<uint8_t *> *response)
+  int spin_until_future_complete(Node node,
+                                 std::future<std::vector<uint8_t>> *response)
   {
     response->wait();
     return 0;
+  }
+
+  void cancel_service_request(uint32_t request_id)
+  {
+    std::promise<std::vector<uint8_t>> promise;
+    bool found = false;
+    {
+      std::lock_guard<std::mutex> lock(map_mutex);
+      auto it = promise_map.find(request_id);
+      if (it != promise_map.end())
+      {
+        promise = std::move(it->second);
+        promise_map.erase(it);
+        found = true;
+      }
+    }
+
+    if (found)
+    {
+      // promiseを未完了のまま破棄すると、std::promiseは待機futureへ
+      // broken_promise例外を設定する。-fno-exceptionsのWASMではそれが
+      // unreachableになるため、timeoutは空フレームで正常完了させる。
+      promise.set_value({});
+    }
   }
 
   // 現状client側のpublisherのみ対応
@@ -339,6 +464,8 @@ namespace mros2
     data_p = new SubscribeDataType;
     data_p->cb_fp = (void (*)(intptr_t))fp;
     data_p->argp = (intptr_t)NULL;
+    data_p->callback_worker.reset(
+        new LatestMessageCallbackWorker<T>(data_p->cb_fp));
     reader->registerCallback(sub.callback_handler<T>, (void *)data_p);
 
     /* Register callback to ensure that a subscriber is matched to the reader before receiving messages */
@@ -520,7 +647,8 @@ namespace mros2
   }
 
   template <class T>
-  std::future<uint8_t *> Publisher::async_send_request(T &msg)
+  std::future<std::vector<uint8_t>> Publisher::async_send_request(
+      T &msg, uint32_t *request_id)
   {
     auto func = [&msg]
     {
@@ -570,27 +698,69 @@ namespace mros2
     }
     else
     {
-      msg.copyToBuf(&buf[4]);
-      msg.memAlign(&buf[4]);
+      // Service requests can be emitted while another publisher is using the
+      // process-wide serialization buffer.  Keep the complete CDR payload on
+      // this call's stack so a concurrent topic publish cannot corrupt the
+      // encapsulation header or request fields before addChange() copies it.
+      uint8_t request_buf[sizeof(buf)] = {0, 1, 0, 0};
+      msg.copyToBuf(&request_buf[4]);
+      msg.memAlign(&request_buf[4]);
+      // Generated message getTotalSize() is destructive: it returns cntPub
+      // and resets that counter to zero.  Calling it once for logging and
+      // again for addChange() used to store only the four-byte CDR header,
+      // dropping the complete service request body from the RTPS DATA sample.
+      const rtps::DataSize_t serialized_payload_size =
+          static_cast<rtps::DataSize_t>(msg.getTotalSize());
+      MROS2_DEBUG("[MROS2LIB] service request CDR header: %02x %02x %02x %02x payload_bytes=%u",
+                  request_buf[0], request_buf[1], request_buf[2], request_buf[3],
+                  static_cast<unsigned int>(serialized_payload_size));
       // pub_ptr->newChange(rtps::ChangeKind_t::ALIVE, buf,
       //                    msg.getTotalSize() + 4);
       // rtps::CacheChange *result = const_cast<rtps::CacheChange *>(pub_ptr->newChange(rtps::ChangeKind_t::ALIVE, buf, msg.getTotalSize() + 4));
-      rtps::Sample_Indetify identify;
-      identify.sn.high = 0x12345678;
-      identify.sn.low = 0x23456789;
+      // newChangeIdentify() fills this empty identity with the request
+      // writer's GUID and the newly allocated RTPS sequence number.  Reusing
+      // a fixed SampleIdentity makes all ROS 2 service requests look like the
+      // same request to the server.
+      rtps::Sample_Indetify identify{};
       // rtps::CacheChange *result = const_cast<rtps::CacheChange *>(pub_ptr->newChangeIdentify(rtps::ChangeKind_t::ALIVE, buf, msg.getTotalSize() + 4, identify));
-      rtps::CacheChange *result = const_cast<rtps::CacheChange *>(pub_ptr_own->newChangeIdentify(rtps::ChangeKind_t::ALIVE, buf, msg.getTotalSize() + 4, identify));
+      rtps::CacheChange *result = const_cast<rtps::CacheChange *>(
+          pub_ptr_own->newChangeIdentify(rtps::ChangeKind_t::ALIVE,
+                                        request_buf,
+                                        serialized_payload_size + 4,
+                                        identify));
       // for service通信
       // sequenceNumberを取得して、別の変数にセット
       SequenceNumber_t sequenceNumber_pub = result->sequenceNumber;
       MROS2_DEBUG("[MROS2LIB] sequenceNumber_pub: %d", sequenceNumber_pub.low);
+      if (request_id != nullptr)
+      {
+        *request_id = sequenceNumber_pub.low;
+      }
 
       // promise
-      std::promise<uint8_t *> promise;
+      std::promise<std::vector<uint8_t>> promise;
       auto future = promise.get_future();
+      std::vector<uint8_t> early_response;
+      bool has_early_response = false;
       {
         std::lock_guard<std::mutex> lock(map_mutex);
-        promise_map[sequenceNumber_pub.low] = std::move(promise);
+        auto early = early_service_responses.find(sequenceNumber_pub.low);
+        if (early != early_service_responses.end())
+        {
+          early_response = std::move(early->second);
+          early_service_responses.erase(early);
+          has_early_response = true;
+        }
+        else
+        {
+          promise_map[sequenceNumber_pub.low] = std::move(promise);
+        }
+      }
+      if (has_early_response)
+      {
+        MROS2_DEBUG("[MROS2LIB] using early service response: id=%u",
+                    sequenceNumber_pub.low);
+        promise.set_value(std::move(early_response));
       }
       return future;
     }
@@ -710,6 +880,8 @@ namespace mros2
     data_p = new SubscribeDataType;
     data_p->cb_fp = (void (*)(intptr_t))fp;
     data_p->argp = (intptr_t)NULL;
+    data_p->callback_worker.reset(
+        new LatestMessageCallbackWorker<T>(data_p->cb_fp));
     reader->registerCallback(sub.callback_handler<T>, (void *)data_p);
 
     /* Register callback to ensure that a subscriber is matched to the reader before receiving messages */
@@ -728,7 +900,6 @@ namespace mros2
     msg.copyFromBuf(&cacheData[4]);                   // copyFromBufはメッセージクラスにある関数
 
     // for service通信
-    cacheChange_buffer = const_cast<uint8_t *>(cacheChange.getData());
     const uint32_t response = cacheChange.response;
     const uint32_t response_id = cacheChange.sn.low;
 
@@ -824,9 +995,7 @@ namespace mros2
   template <class T>
   void Subscriber::callback_handler(void *callee, const rtps::ReaderCacheChange &cacheChange)
   {
-    T msg;
     const uint8_t *cacheData = cacheChange.getData(); // dataのpointerを取得
-    msg.copyFromBuf(&cacheData[4]);                   // copyFromBufはメッセージクラスにある関数
 
     // // for service communication
     // CacheChangeInfo info;
@@ -839,34 +1008,22 @@ namespace mros2
     // }
 
     // for service通信
-    cacheChange_buffer = const_cast<uint8_t *>(cacheChange.getData());
     const uint32_t response = cacheChange.response;
-    const uint32_t response_id = cacheChange.sn.low;
+    // ROS 2 services correlate a reply through PID_RELATED_SAMPLE_IDENTITY,
+    // not through the server writer's independent RTPS sequence number.
+    const uint32_t response_id = cacheChange.identify.sn.low;
+    const uint32_t response_sequence_number = cacheChange.sn.low;
 
-    // for service server test
-    const uint32_t service_msg_sn_high = cacheChange.identify.sn.high;
-    const uint32_t service_msg_sn_low = cacheChange.identify.sn.low;
-    // const uint8_t writer_id = cacheChange.identify.writerId.entityKind;
-    const std::array<uint8_t, 3> entityKey = cacheChange.identify.writerId.entityKey; // writer_id: 0003 0100  -> 0001 0300
-    // const uint32_t writer_id = 1;
-    // MROS2_DEBUG("[MROS2LIB] service response get [callback_handler] entityKey: %lx entityKey: %lx entityKey: %lx entityKey: %lx service_msg_sn_high: %lx service_msg_sn_low: %lx", entityKey, entityKey[0], entityKey[1], entityKey[2], service_msg_sn_high, service_msg_sn_low);
-    // MROS2_DEBUG("[MROS2LIB] message get [callback_handler] msg_sn_high: %lx msg_sn_low: %lx", service_msg_sn_high, service_msg_sn_low);
     MROS2_DEBUG("[MROS2LIB] message get [callback_handler] msg_sn_high: %lx msg_sn_low: %lx", cacheChange.sn.high, cacheChange.sn.low);
-
-    request_identify.guidPrefix = cacheChange.writerGuid.prefix;
-    request_identify.writerId = cacheChange.writerGuid.entityId;
-    request_identify.sn.high = cacheChange.sn.high;
-    request_identify.sn.low = cacheChange.sn.low;
-
-    request_identify_queue.push(request_identify);
 
     if (response != 0)
     {
       // resposeがある場合は、サービスレスポンスが受信された場合
-      MROS2_DEBUG("[MROS2LIB] service response get [callback_handler]");
+      MROS2_DEBUG("[MROS2LIB] service response get [callback_handler] request_id=%u response_sn=%u",
+                  response_id, response_sequence_number);
       // serviceが来たことを通知
       // cv.notify_one();
-      std::promise<uint8_t *> promise;
+      std::promise<std::vector<uint8_t>> promise;
       {
         std::lock_guard<std::mutex> lock(map_mutex);
         auto it = promise_map.find(response_id);
@@ -877,32 +1034,52 @@ namespace mros2
         }
         else
         {
-          // エラー処理：対応するPromiseが見つからない
-          MROS2_DEBUG("[MROS2LIB] エラー処理:対応するPromiseが見つからない");
+          // 要求送信直後の応答は、async_send_request() がpromiseを登録
+          // する前に到着し得る。ReaderCacheChangeの寿命外へ持ち出さない
+          // よう、ここで所有コピーを保存する。
+          const uint8_t *response_data = cacheChange.getData();
+          if (early_service_responses.size() < kMaxEarlyServiceResponses)
+          {
+            early_service_responses[response_id] = std::vector<uint8_t>(
+                response_data, response_data + cacheChange.getDataSize());
+            MROS2_DEBUG("[MROS2LIB] cached early service response: id=%u",
+                        response_id);
+          }
+          else
+          {
+            MROS2_DEBUG("[MROS2LIB] dropped unmatched service response: id=%u",
+                        response_id);
+          }
           return;
         }
       }
-      // Promiseに値を設定
-      promise.set_value(cacheChange_buffer);
+      // ReaderCacheChange はcallback復帰後に再利用され得るため、借用
+      // ポインタではなくRTPS frameの所有コピーをサービス呼び出し側へ渡す。
+      const uint8_t *response_data = cacheChange.getData();
+      promise.set_value(std::vector<uint8_t>(
+          response_data, response_data + cacheChange.getDataSize()));
+
+      // create_client() はReply frameをfutureへ渡すだけでよい。Tはrequest型
+      // なので、下のsubscription workerへ流すとresponseをrequestとして
+      // 誤ってデシリアライズしてしまう。
+      SubscribeDataType *sub = (SubscribeDataType *)callee;
+      if (sub->service_response_only)
+      {
+        return;
+      }
     }
 
     SubscribeDataType *sub = (SubscribeDataType *)callee;
-    void (*fp)(intptr_t) = sub->cb_fp;
-    // fp((intptr_t)&msg);
-    // コールバックをスレッドで分離
-    std::thread th([fp, &msg, cacheData]()
-                   {
-                    //msgのコピーをしたい。msgのポインタを渡すと、コールバック関数内でmsgの値が変わる可能性があるため
-                     T msg_copy;
-                     msg_copy.copyFromBuf(&cacheData[4]);
-                    std::lock_guard<std::mutex> lock(msg_mtx);
+    if (sub->callback_worker == nullptr)
+    {
+      MROS2_ERROR("[MROS2LIB] subscription callback worker is not initialized");
+      return;
+    }
 
-
-                    fp((intptr_t)&msg_copy); });
-    th.detach();
-
-    // th.join();
-    // osDelay(10); // msgの処理が終わるまで待つ msgの排他制御の代わり
+    // Do not invoke the user callback on the DDS receive thread.  enqueue()
+    // copies the frame synchronously, then the fixed worker deserializes and
+    // calls the existing callback ABI with a T* encoded as intptr_t.
+    sub->callback_worker->enqueue(cacheData, cacheChange.getDataSize());
   }
 
   /*
