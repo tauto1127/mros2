@@ -1,4 +1,4 @@
 [submodule "embeddedRTPS"]
 	path = embeddedRTPS
-	url = https://github.com/oss-fun/embeddedRTPS.git
+	url = git@github.com:tauto1127/embeddedRTPS.git
 branch = service-communication
