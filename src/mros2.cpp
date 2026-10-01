@@ -1138,4 +1138,8 @@ void setTrue(void *args)
  * specialize template functions described in platform's workspace
  */
 #include "templates.hpp"
+
+// Service instantiations are optional; topic-only apps may not provide this header.
+#if __has_include("templates-service.hpp")
 #include "templates-service.hpp"
+#endif
