@@ -17,17 +17,13 @@ def main():
     with open(app + "/app.cpp", 'r') as m_f:
             arr = m_f.readlines()
             for m_line in arr:
-                if "create_publisher" in m_line:
-                    line = m_line.strip()
-                    left_idx = line.index('<')
-                    right_idx =line.index('>')
-                    pubMsgTypes.append(line[left_idx+1:right_idx])
-                    
-                if "create_subscription" in m_line:
-                    line = m_line.strip()
-                    left_idx = line.index('<')
-                    right_idx =line.index('>')
-                    subMsgTypes.append(line[left_idx+1:right_idx])
+                publisher = re.search(r"\bcreate_publisher\s*<([^>]+)>", m_line)
+                if publisher and publisher.group(1) not in pubMsgTypes:
+                    pubMsgTypes.append(publisher.group(1))
+
+                subscriber = re.search(r"\bcreate_subscription\s*<([^>]+)>", m_line)
+                if subscriber and subscriber.group(1) not in subMsgTypes:
+                    subMsgTypes.append(subscriber.group(1))
                     
             pubSubUnion = list(set(pubMsgTypes + subMsgTypes))
             for msgType in pubSubUnion:

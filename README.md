@@ -41,6 +41,15 @@ Please see each repository to learn how to use it.
 
 Please let us know if you have a request for a support of board/kernel, or if you could implement this layer on another platform.
 
+## Template generation
+
+The pub/sub template generator looks for `create_publisher<T>` and
+`create_subscription<T>` calls. Diagnostic messages such as
+`event=create_publisher_begin` do not supply message types. Repeated calls
+with the same message type produce one instantiation per pub/sub role.
+
+Run its regression test with `python3 -m unittest discover -s mros2_header_generator/tests`.
+
 ## License
 
 The source code of this repository itself is published under [Apache License 2.0](https://github.com/mROS-base/mros2/blob/main/LICENSE).  
