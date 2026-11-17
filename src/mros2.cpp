@@ -22,12 +22,11 @@
 
 // std::mutex mtx;             // wait で必要（とりあえず無視）
 // std::condition_variable cv; // これを介してスリープをコントロールする
+// 応答待ちの要求（要求番号 → promise）。async_send_request() は要求を
+// 履歴に入れることと、ここへの登録を map_mutex を持ったまま行い、
+// callback_handler() も map_mutex を取ってから探す。そのため、応答が
+// 登録より先に見えることはない（rclcpp の Client と同じ順序）。
 std::map<uint32_t, std::promise<std::vector<uint8_t>>> promise_map;
-// newChangeIdentify() が送信を開始してからpromise_mapへ登録するまでの
-// 短い区間に、ローカル/高速なサービス応答が届くことがある。その応答を
-// 捨てずに一時保持し、要求側の登録完了後に渡す。
-std::map<uint32_t, std::vector<uint8_t>> early_service_responses;
-constexpr size_t kMaxEarlyServiceResponses = 16;
 std::mutex map_mutex;
 // for service server
 std::queue<rtps::Sample_Indetify> request_identify_queue;
@@ -722,45 +721,28 @@ namespace mros2
       // a fixed SampleIdentity makes all ROS 2 service requests look like the
       // same request to the server.
       rtps::Sample_Indetify identify{};
-      // rtps::CacheChange *result = const_cast<rtps::CacheChange *>(pub_ptr->newChangeIdentify(rtps::ChangeKind_t::ALIVE, buf, msg.getTotalSize() + 4, identify));
-      rtps::CacheChange *result = const_cast<rtps::CacheChange *>(
-          pub_ptr_own->newChangeIdentify(rtps::ChangeKind_t::ALIVE,
-                                        request_buf,
-                                        serialized_payload_size + 4,
-                                        identify));
-      // for service通信
-      // sequenceNumberを取得して、別の変数にセット
-      SequenceNumber_t sequenceNumber_pub = result->sequenceNumber;
+      std::promise<std::vector<uint8_t>> promise;
+      auto future = promise.get_future();
+      SequenceNumber_t sequenceNumber_pub;
+      {
+        // 要求を履歴に入れて要求番号が決まってから promise を登録するまで、
+        // map_mutex を持ち続ける。newChangeIdentify() は履歴に入れて送信を
+        // writer のスレッドへ頼むだけなので、ロックを持つのは短い。応答が
+        // その間に届いても、callback_handler() は map_mutex を待つので、
+        // 探す時点では必ず登録が済んでいる。
+        std::lock_guard<std::mutex> lock(map_mutex);
+        rtps::CacheChange *result = const_cast<rtps::CacheChange *>(
+            pub_ptr_own->newChangeIdentify(rtps::ChangeKind_t::ALIVE,
+                                          request_buf,
+                                          serialized_payload_size + 4,
+                                          identify));
+        sequenceNumber_pub = result->sequenceNumber;
+        promise_map[sequenceNumber_pub.low] = std::move(promise);
+      }
       MROS2_DEBUG("[MROS2LIB] sequenceNumber_pub: %d", sequenceNumber_pub.low);
       if (request_id != nullptr)
       {
         *request_id = sequenceNumber_pub.low;
-      }
-
-      // promise
-      std::promise<std::vector<uint8_t>> promise;
-      auto future = promise.get_future();
-      std::vector<uint8_t> early_response;
-      bool has_early_response = false;
-      {
-        std::lock_guard<std::mutex> lock(map_mutex);
-        auto early = early_service_responses.find(sequenceNumber_pub.low);
-        if (early != early_service_responses.end())
-        {
-          early_response = std::move(early->second);
-          early_service_responses.erase(early);
-          has_early_response = true;
-        }
-        else
-        {
-          promise_map[sequenceNumber_pub.low] = std::move(promise);
-        }
-      }
-      if (has_early_response)
-      {
-        MROS2_DEBUG("[MROS2LIB] using early service response: id=%u",
-                    sequenceNumber_pub.low);
-        promise.set_value(std::move(early_response));
       }
       return future;
     }
@@ -1034,22 +1016,11 @@ namespace mros2
         }
         else
         {
-          // 要求送信直後の応答は、async_send_request() がpromiseを登録
-          // する前に到着し得る。ReaderCacheChangeの寿命外へ持ち出さない
-          // よう、ここで所有コピーを保存する。
-          const uint8_t *response_data = cacheChange.getData();
-          if (early_service_responses.size() < kMaxEarlyServiceResponses)
-          {
-            early_service_responses[response_id] = std::vector<uint8_t>(
-                response_data, response_data + cacheChange.getDataSize());
-            MROS2_DEBUG("[MROS2LIB] cached early service response: id=%u",
-                        response_id);
-          }
-          else
-          {
-            MROS2_DEBUG("[MROS2LIB] dropped unmatched service response: id=%u",
-                        response_id);
-          }
+          // 待っていない要求番号の応答。登録より先に届くことは無いので、
+          // タイムアウトして取り消した要求の遅い応答か、別のクライアント
+          // 宛ての応答。rclcpp と同じく捨てる。
+          MROS2_DEBUG("[MROS2LIB] dropped unmatched service response: id=%u",
+                      response_id);
           return;
         }
       }
